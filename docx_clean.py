@@ -12,6 +12,9 @@
 
 只读原文件、只写新文件（``--in-place`` 除外，且会留 ``.bak``）；文档正文一个字都不改。
 
+界面语言会跟随控制台：能显示中文就用中文，否则自动切英文
+（也可用环境变量 ``DOCX_CLEAN_LANG=zh|en`` 强制）。
+
 用法
 ----
     python docx_clean.py 文档.docx                 # 生成 文档_clean.docx
@@ -25,20 +28,61 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import sys
 import zipfile
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 FEFF = "\ufeff"
 ZERO_WIDTH_RE = re.compile("[\u200b-\u200d\u2060\u180e]")
 CR_RE = re.compile(r"<w:cr\s*/>")
-# 只处理 word/ 下的 XML 部件（正文、页眉页脚、脚注尾注、批注、样式、设置等）
+# 只处理 word/ 下的 XML 部件（正文、页眉页脚、脚注尾注、批注、样式、主题、设置等）
 XML_PART_RE = re.compile(r"^word/.*\.xml$", re.IGNORECASE)
 
+
+# --------------------------------------------------------------------------
+# 控制台：语言选择 + 永不因编码而崩溃
+# --------------------------------------------------------------------------
+
+def _detect_lang() -> str:
+    forced = os.environ.get("DOCX_CLEAN_LANG", "").strip().lower()
+    if forced in ("zh", "en"):
+        return forced
+    encoding = (getattr(sys.stdout, "encoding", None) or "ascii")
+    try:
+        "零".encode(encoding, "strict")
+        return "zh"
+    except Exception:
+        return "en"
+
+
+LANG = _detect_lang()
+
+
+def t(zh: str, en: str) -> str:
+    """按界面语言取词。"""
+    return zh if LANG == "zh" else en
+
+
+def _make_output_safe() -> None:
+    """Windows 控制台可能是 cp1252/cp936：输出中文时不要抛 UnicodeEncodeError。
+
+    保留控制台原有编码（中文 Windows 上显示正常），只是不再因为个别字符编码失败而崩掉。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------
+# 核心逻辑
+# --------------------------------------------------------------------------
 
 class Stats:
     """一次清理的统计结果。"""
@@ -72,14 +116,21 @@ class Stats:
 
     def describe(self) -> str:
         lines = [
-            f"U+FEFF={self.feff}  零宽字符={self.zero_width}  软回车<w:cr/>={self.cr}",
+            t(
+                f"U+FEFF={self.feff}  零宽字符={self.zero_width}  软回车<w:cr/>={self.cr}",
+                f"U+FEFF={self.feff}  zero-width={self.zero_width}  <w:cr/> soft returns={self.cr}",
+            )
         ]
         for name in self.parts_touched:
             lines.append(f"      {name}")
         if not self.junk:
-            lines.append("      未发现需要清理的标记（文件本身是干净的）")
+            lines.append(t("      未发现需要清理的标记（文件本身是干净的）",
+                           "      nothing to clean (file is already tidy)"))
         if self.skipped:
-            lines.append(f"      跳过（非 UTF-8 文本部件）: {', '.join(self.skipped)}")
+            lines.append(
+                t(f"      跳过（非 UTF-8 文本部件）: {', '.join(self.skipped)}",
+                  f"      skipped (not UTF-8 text): {', '.join(self.skipped)}")
+            )
         return "\n".join(lines)
 
 
@@ -107,9 +158,9 @@ def clean_docx(
     """清理 ``src``，写出到 ``dst``（默认 ``<名字>_clean.docx``）。"""
     src = Path(src)
     if not src.is_file():
-        raise FileNotFoundError(f"找不到文件: {src}")
+        raise FileNotFoundError(t(f"找不到文件: {src}", f"file not found: {src}"))
     if src.suffix.lower() != ".docx":
-        raise ValueError(f"只支持 .docx: {src}")
+        raise ValueError(t(f"只支持 .docx: {src}", f"only .docx is supported: {src}"))
 
     explicit_output = dst is not None
     if in_place:
@@ -137,7 +188,8 @@ def clean_docx(
                         stats.zero_width += zw
                         stats.cr += cr
                         stats.parts_touched.append(
-                            f"{info.filename}: FEFF={feff} 零宽={zw} 软回车={cr}"
+                            t(f"{info.filename}: FEFF={feff} 零宽={zw} 软回车={cr}",
+                              f"{info.filename}: FEFF={feff} zero-width={zw} <w:cr/>={cr}")
                         )
                         data = new_text.encode("utf-8")
             members.append((info, data))
@@ -160,10 +212,7 @@ def clean_docx(
         with zipfile.ZipFile(tmp, "w") as zout:
             for info, data in members:
                 zout.writestr(info, data)
-        if in_place:
-            tmp.replace(target)
-        else:
-            tmp.replace(target)
+        tmp.replace(target)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
@@ -184,28 +233,40 @@ def _iter_inputs(patterns: list[str]) -> list[Path]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _make_output_safe()
     parser = argparse.ArgumentParser(
         prog="docx_clean",
-        description="清理 .docx 里的隐形垃圾（U+FEFF、零宽字符）与非标准软回车 <w:cr/>",
-        epilog="示例: python docx_clean.py 报告.docx --dry-run",
+        description=t(
+            "清理 .docx 里的隐形垃圾（U+FEFF、零宽字符）与非标准软回车 <w:cr/>",
+            "Remove invisible junk from .docx (U+FEFF, zero-width chars) and WPS <w:cr/> soft returns",
+        ),
+        epilog=t(
+            "示例: python docx_clean.py 报告.docx --dry-run",
+            "example: python docx_clean.py report.docx --dry-run",
+        ),
     )
-    parser.add_argument("inputs", nargs="+", help="要清理的 .docx 文件、目录或通配符")
-    parser.add_argument("-o", "--output", help="输出路径（仅单个输入时有效）")
-    parser.add_argument(
-        "--in-place", action="store_true", help="就地改写原文件（会生成 .bak 备份）"
-    )
-    parser.add_argument("--dry-run", action="store_true", help="只报告发现的问题，不写文件")
-    parser.add_argument("--json", action="store_true", help="以 JSON 输出结果")
-    parser.add_argument("--quiet", action="store_true", help="只输出出错信息")
+    parser.add_argument("inputs", nargs="+", help=t("要清理的 .docx 文件、目录或通配符",
+                                                    "one or more .docx files, directories or globs"))
+    parser.add_argument("-o", "--output",
+                        help=t("输出路径（仅单个输入时有效）", "output path (single input only)"))
+    parser.add_argument("--in-place", action="store_true",
+                        help=t("就地改写原文件（会生成 .bak 备份）",
+                               "rewrite the source file, keeping a .bak backup"))
+    parser.add_argument("--dry-run", action="store_true",
+                        help=t("只报告发现的问题，不写文件", "report only, write nothing"))
+    parser.add_argument("--json", action="store_true", help="JSON output")
+    parser.add_argument("--quiet", action="store_true",
+                        help=t("只输出出错信息", "only print errors"))
     parser.add_argument("--version", action="version", version=f"docx-junk-cleaner {__version__}")
     args = parser.parse_args(argv)
 
     files = _iter_inputs(args.inputs)
     if not files:
-        print("没有匹配到任何 .docx 文件", file=sys.stderr)
+        print(t("没有匹配到任何 .docx 文件", "no .docx file matched"), file=sys.stderr)
         return 1
     if args.output and len(files) > 1:
-        print("-o/--output 只能配合单个输入使用", file=sys.stderr)
+        print(t("-o/--output 只能配合单个输入使用", "-o/--output requires a single input"),
+              file=sys.stderr)
         return 2
 
     results: list[Stats] = []
@@ -220,13 +281,16 @@ def main(argv: list[str] | None = None) -> int:
             )
         except (OSError, ValueError, zipfile.BadZipFile) as exc:
             failed += 1
+            results.append(Stats(f))
             if args.json:
-                results.append(Stats(f))
                 print(json.dumps({"source": str(f), "error": str(exc)}, ensure_ascii=False))
             else:
-                print(f"[失败] {f}\n      {exc}", file=sys.stderr)
-                if isinstance(exc, PermissionError) or "being used" in str(exc):
-                    print("      文件可能正被 Word/WPS 打开，请先关闭再试。", file=sys.stderr)
+                print(t(f"[失败] {f}", f"[FAILED] {f}"), file=sys.stderr)
+                print(f"      {exc}", file=sys.stderr)
+                if isinstance(exc, PermissionError):
+                    print(t("      文件可能正被 Word/WPS 打开，请先关闭再试。",
+                            "      the file may be open in Word/WPS - close it and retry."),
+                          file=sys.stderr)
             continue
 
         results.append(stats)
@@ -234,11 +298,12 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(stats.as_dict(), ensure_ascii=False))
         elif not args.quiet:
             if args.dry_run:
-                print(f"[检查] {f.name}")
+                print(t(f"[检查] {f.name}", f"[check] {f.name}"))
             elif stats.junk:
-                print(f"[完成] {stats.output.name}")
+                print(t(f"[完成] {stats.output.name}", f"[done] {stats.output.name}"))
             else:
-                print(f"[跳过] {f.name}（未发现需要清理的标记）")
+                print(t(f"[跳过] {f.name}（未发现需要清理的标记）",
+                        f"[skip] {f.name} (nothing to clean)"))
                 continue
             print(stats.describe())
 
